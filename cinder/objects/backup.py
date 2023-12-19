@@ -219,6 +219,15 @@ class Backup(base.CinderPersistentObject, base.CinderObject,
         retval = jsonutils.dump_as_bytes(kwargs)
         return base64.encode_as_text(retval)
 
+    @classmethod
+    def get_by_parent_id(cls, context, parent_id):
+        if 'parent_id' not in cls.fields:
+            msg = (_('VersionedObject %s cannot retrieve object by '
+                     'parent_id.') % (cls.obj_name()))
+            raise NotImplementedError(msg)
+        orm_obj = db.backup_get_parent_id(context, parent_id)
+        return cls._from_db_object(context, cls(context), orm_obj)
+
 
 @base.CinderObjectRegistry.register
 class BackupList(base.ObjectListBase, base.CinderObject):

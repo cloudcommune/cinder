@@ -16,10 +16,20 @@
 from __future__ import absolute_import
 import binascii
 import errno
+import eventlet
+import hashlib
 import json
 import math
 import os
+import sys
+if sys.version > '3':
+    import queue as Queue
+else:
+    import Queue
 import tempfile
+from threading import Thread
+import time
+import fcntl
 
 from castellan import key_manager
 from eventlet import tpool
@@ -29,7 +39,6 @@ from oslo_log import log as logging
 from oslo_service import loopingcall
 from oslo_utils import encodeutils
 from oslo_utils import excutils
-from oslo_utils import fileutils
 from oslo_utils import units
 import six
 from six.moves import urllib
@@ -44,7 +53,6 @@ from cinder import utils
 from cinder.volume import configuration
 from cinder.volume import driver
 from cinder.volume import volume_utils
-
 try:
     import rados
     import rbd
@@ -52,6 +60,15 @@ except ImportError:
     rados = None
     rbd = None
 
+# take example from module processutils in oslo.concurrency labrary.
+# NOTE(bnemec): eventlet doesn't monkey patch subprocess, so we need to
+# determine the proper subprocess module to use ourselves.  I'm using the
+# time module as the check because that's a monkey patched module we use
+# in combination with subprocess below, so they need to match.
+if eventlet and eventlet.patcher.is_monkey_patched(time):
+    from eventlet.green import subprocess
+else:
+    import subprocess
 
 LOG = logging.getLogger(__name__)
 
@@ -133,6 +150,12 @@ EXTRA_SPECS_REPL_ENABLED = "replication_enabled"
 EXTRA_SPECS_MULTIATTACH = "multiattach"
 
 
+class Snapshot(object):
+    def __init__(self, volume_name, snap_name):
+        self.volume_name = volume_name
+        self.name = snap_name
+
+
 # RBD
 class RBDDriverException(exception.VolumeDriverException):
     message = _("RBD Cinder driver failure: %(reason)s")
@@ -190,9 +213,9 @@ class RBDVolumeProxy(object):
 
 class RADOSClient(object):
     """Context manager to simplify error handling for connecting to ceph."""
-    def __init__(self, driver, pool=None):
+    def __init__(self, driver, pool=None, remote=None):
         self.driver = driver
-        self.cluster, self.ioctx = driver._connect_to_rados(pool)
+        self.cluster, self.ioctx = driver._connect_to_rados(pool, remote)
 
     def __enter__(self):
         return self
@@ -252,6 +275,11 @@ class RBDDriver(driver.CloneableImageVD, driver.MigrateVD,
         self._is_replication_enabled = False
         self._replication_targets = []
         self._target_names = []
+        self._glance_config = {
+            'name': utils.convert_str(CONF.glance_ceph_cluster_name),
+            'conf': utils.convert_str(CONF.glance_ceph_conf),
+            'user': utils.convert_str(CONF.glance_ceph_user)
+        }
 
         if self.rbd is not None:
             self.RBD_FEATURE_LAYERING = self.rbd.RBD_FEATURE_LAYERING
@@ -396,10 +424,10 @@ class RBDDriver(driver.CloneableImageVD, driver.MigrateVD,
     def RBDProxy(self):
         return tpool.Proxy(self.rbd.RBD())
 
-    def _ceph_args(self):
+    def _ceph_args(self, remote=None):
         args = []
 
-        name, conf, user, secret_uuid = self._get_config_tuple()
+        name, conf, user, secret_uuid = self._get_config_tuple(remote)
 
         if user:
             args.extend(['--id', user])
@@ -456,6 +484,232 @@ class RBDDriver(driver.CloneableImageVD, driver.MigrateVD,
         # closing an ioctx cannot raise an exception
         ioctx.close()
         client.shutdown()
+
+    def _rbd_snap_export(self, pool, volume, snap, path, remote=None):
+        args = ['rbd', 'export',
+                '--pool', pool,
+                '--image', volume,
+                '--snap', snap,
+                '--path', path]
+        args.extend(self._ceph_args(remote))
+        self._try_execute(*args)
+
+    def _get_image_snap(self, volume_name, pool, tmp_image_snap):
+        # Get list of tmp image snapshots that exist on this volume.
+        image_snap = None
+
+        with RBDVolumeProxy(self, volume_name, pool) as vol:
+            snaps = vol.list_snaps()
+            for snap in snaps:
+                snap_name_utf8 = utils.convert_str(snap['name'])
+                if snap_name_utf8.endswith(tmp_image_snap):
+                    image_snap = snap_name_utf8
+
+        return image_snap
+
+    def _rbd_image_copy(self, pool, image, snap, dest_pool, dest_image):
+        args = ['rbd', 'copy',
+                '--pool', pool,
+                '--image', image,
+                '--snap', snap,
+                '--dest-pool', dest_pool,
+                '--dest', dest_image]
+        args.extend(self._ceph_args())
+        self._try_execute(*args)
+
+    def _rbd_export_import_pipe(self, src_ceph_conf, src_pool,
+                                src_name, src_snap,
+                                dest_ceph_conf, dest_pool, dest_name):
+        LOG.debug("Performing transfer from '%(src)s' to "
+                  "'%(dest)s'",
+                  {'src': src_name, 'dest': dest_name})
+
+        # NOTE(dosaboy): Need to be tolerant of clusters/clients that do
+        # not support these operations since at the time of writing they
+        # were very new.
+
+        cmd1 = ['rbd', 'export'] + self._ceph_args(src_ceph_conf)
+        src_path = utils.convert_str("%s/%s@%s"
+                                 % (src_pool, src_name, src_snap))
+        cmd1.extend([src_path, '-'])
+
+        cmd2 = ['rbd', 'import'] + self._ceph_args(dest_ceph_conf)
+        dest_path = utils.convert_str("%s/%s" % (dest_pool, dest_name))
+        cmd2.extend(['-', dest_path])
+
+        ret, stderr = self._piped_execute(cmd1, cmd2)
+        if ret:
+            msg = (_("RBD transfer op failed - (ret=%(ret)s stderr=%(stderr)s)") %
+                   {'ret': ret, 'stderr': stderr})
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
+    def _piped_execute(self, cmd1, cmd2):
+        """Pipe output of cmd1 into cmd2."""
+        LOG.debug("Piping cmd1='%s' into...", ' '.join(cmd1))
+        LOG.debug("cmd2='%s'", ' '.join(cmd2))
+
+        try:
+            p1 = subprocess.Popen(cmd1, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE,
+                                  close_fds=True)
+        except OSError as e:
+            LOG.error("Pipe1 failed - %s ", e)
+            raise
+
+        # NOTE(dosaboy): ensure that the pipe is blocking. This is to work
+        # around the case where evenlet.green.subprocess is used which seems to
+        # use a non-blocking pipe.
+        flags = fcntl.fcntl(p1.stdout, fcntl.F_GETFL) & (~os.O_NONBLOCK)
+        fcntl.fcntl(p1.stdout, fcntl.F_SETFL, flags)
+
+        try:
+            p2 = subprocess.Popen(cmd2, stdin=p1.stdout,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE,
+                                  close_fds=True)
+        except OSError as e:
+            LOG.error("Pipe2 failed - %s ", e)
+            raise
+
+        p1.stdout.close()
+        stdout, stderr = p2.communicate()
+        return p2.returncode, stderr
+
+    def _glance_image_remove(self, pool, image, remote=None):
+        """Delete a image"""
+        image_name = utils.convert_str(image)
+        with RADOSClient(self, pool, remote) as client:
+            try:
+                rbd_image = self.rbd.Image(client.ioctx, image_name)
+            except self.rbd.ImageNotFound:
+                LOG.info("image %(image_name)s no longer exists in "
+                         "%(pool)s", {"image_name": image_name, "pool": pool})
+                return
+
+            try:
+                snaps = rbd_image.list_snaps()
+                for snap in snaps:
+                    snap_name = snap['name']
+                    if snap_name == 'snap':
+                        snapshot = Snapshot(image_name, snap_name)
+                        self.delete_snapshot(snapshot, pool, remote)
+            finally:
+                rbd_image.close()
+
+            @utils.retry(self.rbd.ImageBusy,
+                         self.configuration.rados_connection_interval,
+                         self.configuration.rados_connection_retries)
+            def _try_remove_volume(client, image):
+                self.RBDProxy().remove(client.ioctx, image)
+
+            try:
+                _try_remove_volume(client, image_name)
+            except self.rbd.ImageBusy:
+                msg = (_("ImageBusy error raised while deleting rbd "
+                         "volume. This may have been caused by a "
+                         "connection from a client that has crashed and, "
+                         "if so, may be resolved by retrying the delete "
+                         "after 30 seconds has elapsed."))
+                LOG.warning(msg)
+
+    def _rbd_image_md5(self, pool, image_id, image_snap_name=None,
+                       remote=None):
+        """Open image or snap, then get md5.
+
+        Default value of the rbd_store_chunk_size is 4M, here chunk_size is
+        16M that the mode 4 * rbd_store_chunk_size. It may be cause cpu used
+        100% when chunk_size big than 16M.
+        """
+        chunk_size = (self.configuration.rbd_store_chunk_size * 4) * units.Mi
+
+        checksum = hashlib.md5()
+
+        with RBDVolumeProxy(self, image_id, pool, snapshot=image_snap_name,
+                            remote=remote, read_only=True) as rbd_image:
+            rbd_image_length = rbd_image.size()
+            rbd_meta = linuxrbd.RBDImageMetadata(rbd_image, pool,
+                                                 remote['user'],
+                                                 remote['conf'])
+            rbd_fd = linuxrbd.RBDVolumeIOWrapper(rbd_meta)
+            chunks = int(rbd_image_length / chunk_size)
+            for chunk in range(0, chunks):
+                before = time.time()
+                checksum.update(rbd_fd.read(chunk_size))
+                delta = (time.time() - before)
+                rate = (chunk_size / delta) / units.Mi
+                LOG.debug("Read chunk %(chunk)s of %(chunks)s "
+                          "(%(rate)dM/s)", {'chunk': chunk + 1,
+                                            'chunks': chunks,
+                                            'rate': rate})
+                eventlet.sleep(0.1)
+
+            rem = int(rbd_image_length % chunk_size)
+            if rem:
+                LOG.debug("Read remaining %s bytes", rem)
+                checksum.update(rbd_fd.read(rem))
+                eventlet.sleep(0.1)
+
+            return checksum.hexdigest()
+
+    def _volume_to_image(self, context, volume, image_service, image_meta,
+                         image_id, image_snap_name, queue):
+
+        tmp_image_snap = 'tmp_image_snap'
+        snapshot_create = None
+        tmp_snap_exists = False
+
+        try:
+            # try to delete the last uncleaned image snapshot
+            image_snap = self._get_image_snap(volume.name,
+                                              self.configuration.rbd_pool,
+                                              tmp_image_snap)
+            if image_snap:
+                self.delete_snapshot(Snapshot(volume.name, image_snap))
+
+            # create temp snapshot for exporting rbd to tmp_file
+            snapshot_create = Snapshot(volume.name, tmp_image_snap)
+            self.create_snapshot(snapshot_create)
+            LOG.debug("sending upload_to_image.snapped event.")
+            self._notify_about_volume_usage(context, volume,
+                                            "upload_to_image.snapped")
+            tmp_snap_exists = True
+
+            # import image and create snapsot
+            self._rbd_export_import_pipe(self._active_config,
+                                         self.configuration.rbd_pool,
+                                         volume.name, tmp_image_snap,
+                                         self._glance_config,
+                                         CONF.glance_ceph_pool, image_id)
+
+            # delete volume snapshot
+            self.delete_snapshot(snapshot_create)
+            tmp_snap_exists = False
+
+            # create image snapshot
+            image_snap_create = Snapshot(image_id, image_snap_name)
+            self.create_snapshot(image_snap_create,
+                                 CONF.glance_ceph_pool,
+                                 self._glance_config)
+
+            image_meta['direct_url'] = 'rbd://%s/%s/%s/%s' % (
+                self._get_fsid(self._glance_config, pool=CONF.glance_ceph_pool),
+                CONF.glance_ceph_pool,
+                image_id, image_snap_name)
+
+            image_utils.upload_volume(context, image_service,
+                                      image_meta, None)
+        except Exception:
+            self._glance_image_remove(CONF.glance_ceph_pool,
+                                      image_id, self._glance_config)
+
+            msg = (_("Failed to upload image of the %(image)s ") %
+                   {'image': image_id})
+            queue.put(msg)
+
+        finally:
+            if tmp_snap_exists and snapshot_create:
+                self.delete_snapshot(snapshot_create)
 
     def _get_backup_snaps(self, rbd_image):
         """Get list of any backup snapshots that exist on this volume.
@@ -1186,23 +1440,25 @@ class RBDDriver(driver.CloneableImageVD, driver.MigrateVD,
                 new_name = "%s.deleted" % (volume_name)
                 self.RBDProxy().rename(client.ioctx, volume_name, new_name)
 
-    def create_snapshot(self, snapshot):
+    def create_snapshot(self, snapshot, pool=None, remote=None):
         """Creates an rbd snapshot."""
-        with RBDVolumeProxy(self, snapshot.volume_name) as volume:
+        with RBDVolumeProxy(self, snapshot.volume_name, pool,
+                            remote=remote) as volume:
             snap = utils.convert_str(snapshot.name)
             volume.create_snap(snap)
             volume.protect_snap(snap)
 
-    def delete_snapshot(self, snapshot):
+    def delete_snapshot(self, snapshot, pool=None, remote=None):
         """Deletes an rbd snapshot."""
         # NOTE(dosaboy): this was broken by commit cbe1d5f. Ensure names are
         #                utf-8 otherwise librbd will barf.
         volume_name = utils.convert_str(snapshot.volume_name)
         snap_name = utils.convert_str(snapshot.name)
 
-        with RBDVolumeProxy(self, volume_name) as volume:
+        with RBDVolumeProxy(self, volume_name, pool, remote=remote) as volume:
             try:
-                volume.unprotect_snap(snap_name)
+                if volume.is_protected_snap(snap_name):
+                    volume.unprotect_snap(snap_name)
             except self.rbd.InvalidArgument:
                 LOG.info(
                     "InvalidArgument: Unable to unprotect snapshot %s.",
@@ -1415,6 +1671,7 @@ class RBDDriver(driver.CloneableImageVD, driver.MigrateVD,
                                    volume.name),
                 'hosts': hosts,
                 'ports': ports,
+                'conffile': self.configuration.rbd_ceph_conf,
                 'cluster_name': name,
                 'auth_enabled': (user is not None),
                 'auth_username': user,
@@ -1446,8 +1703,8 @@ class RBDDriver(driver.CloneableImageVD, driver.MigrateVD,
             raise exception.ImageUnacceptable(image_id=location, reason=reason)
         return pieces
 
-    def _get_fsid(self):
-        with RADOSClient(self) as client:
+    def _get_fsid(self, remote=None, pool=None):
+        with RADOSClient(self, remote=remote, pool=pool) as client:
             # Librados's get_fsid is represented as binary
             # in py3 instead of str as it is in py2.
             # This causes problems with cinder rbd
@@ -1596,19 +1853,77 @@ class RBDDriver(driver.CloneableImageVD, driver.MigrateVD,
             raise exception.ReplicationError(reason=err_msg,
                                              volume_id=volume.id)
 
-    def copy_volume_to_image(self, context, volume, image_service, image_meta):
-        tmp_dir = volume_utils.image_conversion_dir()
-        tmp_file = os.path.join(tmp_dir,
-                                volume.name + '-' + image_meta['id'])
-        with fileutils.remove_path_on_error(tmp_file):
-            args = ['rbd', 'export',
-                    '--pool', self.configuration.rbd_pool,
-                    volume.name, tmp_file]
-            args.extend(self._ceph_args())
-            self._try_execute(*args)
+    def _update_image_checksum(self, context, image_service, image_meta,
+                               image_id, image_snap_name):
+        try:
+            md5 = self._rbd_image_md5(CONF.glance_ceph_pool, image_id,
+                                      image_snap_name, self._glance_config)
+            #eventlet.sleep(3600)
+            image_meta['checksum'] = md5
+            image_meta['only_update_checksum'] = True
+            image_meta.pop('size')
+            image_meta.pop('locations')
             image_utils.upload_volume(context, image_service,
-                                      image_meta, tmp_file)
-        os.unlink(tmp_file)
+                                      image_meta, None)
+        except Exception as e:
+            msg = (_LE("Update checksum of the image %(image)s "
+                       "metadata failed. The reason is %(msg)s.") %
+                   {'image': image_id, 'msg': e})
+            LOG.error(msg)
+
+    def _notify_about_volume_usage(self, context, volume, event_suffix,
+                                   extra_usage_info=None):
+        volume_utils.notify_about_volume_usage(
+            context, volume, event_suffix,
+            extra_usage_info=extra_usage_info, host=self.host)
+
+    def copy_volume_to_image(self, context, volume, image_service, image_meta):
+
+        image_id = image_meta['id']
+        image_snap_name = 'snap'
+
+        queue = Queue.Queue()
+        t = Thread(target=self._volume_to_image,
+                   args=(context, volume, image_service, image_meta,
+                         image_id, image_snap_name, queue,))
+        t.start()
+        while t.is_alive():
+            """sleep 0s may be cause cpu 100%"""
+            eventlet.sleep(3)
+
+        if not queue.empty():
+            msg = queue.get()
+            raise exception.VolumeBackendAPIException(data=msg)
+
+        # Try to update checksum of image whether it's successful or not.
+        t = Thread(target=self._update_image_checksum,
+                   args=(context, image_service, image_meta,
+                         image_id, image_snap_name,))
+        t.start()
+
+    def get_image_used_size(self, context, image, snap="snap"):
+        """get used size of the image,volume"""
+        if type(image) is dict and 'file' in image:
+            pool = CONF.glance_ceph_pool
+            image_id = image['id']
+        else:
+            pool = self.configuration.rbd_pool
+            image_id = image.name
+        snap_name = self._get_image_snap(image_id, pool, snap)
+        ceph_args = ['--pool', pool]
+        ceph_args.extend(self._ceph_args())
+        queue = Queue.Queue()
+        t = Thread(target=volume_utils.get_used_size,
+                   args=(ceph_args, image_id, queue, snap_name,))
+        t.start()
+        while t.is_alive():
+            eventlet.sleep(3)
+
+        if not queue.empty():
+            result = queue.get()
+            if result[0] == 'msg':
+                raise exception.VolumeBackendAPIException(data=result[1])
+            return result[1]
 
     def extend_volume(self, volume, new_size):
         """Extend an existing volume."""

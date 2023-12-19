@@ -659,9 +659,26 @@ def _validate_file_format(image_data, expected_format):
     return False
 
 
-def upload_volume(context, image_service, image_meta, volume_path,
+def upload_volume(context, image_service, image_meta, volume_path=None,
                   volume_format='raw', run_as_root=True, compress=True):
     image_id = image_meta['id']
+    if not volume_path:
+        if (image_meta['checksum']
+                and image_meta.pop('only_update_checksum')):
+            image_service.update(context, image_id, image_meta)
+            return
+
+        location_url = image_meta.pop('direct_url', None)
+        if not location_url:
+            raise exception.ImageUnacceptable(
+                image_id=image_id,
+                reason=_("image %(image_id)s create "
+                         "failed") % {'image_id': image_id})
+
+        image_service.add_location(context, image_id, location_url, {})
+
+        return
+
     if image_meta.get('container_format') != 'compressed':
         if (image_meta['disk_format'] == volume_format):
             LOG.debug("%s was %s, no need to convert to %s",

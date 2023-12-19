@@ -1223,17 +1223,19 @@ class CreateVolumeFlowManagerTestCase(test.TestCase):
             fake_driver.create_volume_from_backup.side_effect = [
                 NotImplementedError]
         fake_manager._create_from_backup(self.ctxt, volume_obj,
-                                         backup_obj.id)
+                                         backup_obj.id, is_rollback=True)
         fake_driver.create_volume_from_backup.assert_called_once_with(
             volume_obj, backup_obj)
         if driver_error:
-            mock_create_volume.assert_called_once_with(self.ctxt, volume_obj)
+            mock_create_volume.assert_called_once_with(self.ctxt, volume_obj,
+                                                       **{'is_rollback': True})
             mock_get_backup_host.assert_called_once_with(
                 backup_obj.host, backup_obj.availability_zone)
             mock_restore_backup.assert_called_once_with(self.ctxt,
                                                         backup_host,
                                                         backup_obj,
-                                                        volume_obj['id'])
+                                                        volume_obj['id'],
+                                                        is_rollback=True)
         else:
             fake_driver.create_volume_from_backup.assert_called_once_with(
                 volume_obj, backup_obj)

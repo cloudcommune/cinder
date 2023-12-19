@@ -59,6 +59,15 @@ from cinder.volume import group_types
 from cinder.volume import throttling
 from cinder.volume import volume_types
 
+# take example from module processutils in oslo.concurrency labrary.
+# NOTE(bnemec): eventlet doesn't monkey patch subprocess, so we need to
+# determine the proper subprocess module to use ourselves.  I'm using the
+# time module as the check because that's a monkey patched module we use
+# in combination with subprocess below, so they need to match.
+if eventlet and eventlet.patcher.is_monkey_patched(time):
+    from eventlet.green import subprocess
+else:
+    import subprocess
 
 CONF = cfg.CONF
 
@@ -75,6 +84,35 @@ IMAGE_ATTRIBUTES = (
     'min_ram',
     'size',
 )
+
+
+def get_used_size(ceph_args, base_name, queue, snap=None):
+    """get current used size of image, volume, backup """
+    cmd_args = ['rbd', 'du', '--format', 'json'] + ceph_args
+    image_name = utils.convert_str(base_name)
+    if snap:
+        image_name = "%s@%s" % (image_name, utils.convert_str(snap))
+    cmd_args.extend([image_name])
+    LOG.debug("cmd_args='%s'", ' '.join(cmd_args))
+
+    try:
+        p1 = subprocess.Popen(cmd_args, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+    except OSError as e:
+        LOG.error("Get usage pipe failed - %s ", e)
+        raise
+    stdout, stderr = p1.communicate()
+    json_stdout = json.loads(stdout)
+    snapshots = json_stdout['images']
+    for snapshot in snapshots:
+        if 'snapshot' in snapshot and snapshot['snapshot'] == snap:
+            queue.put(('data', int(math.ceil(float(
+                      snapshot['used_size']) / units.Mi))))
+            return
+    errmsg = (_("Can not found '%(snap)s' of the '%(image)s'. "
+                "The reason: %(out)s") % {
+        "image": base_name, "snap": snap, "out": stdout})
+    queue.put(('msg', errmsg))
 
 
 def null_safe_str(s):

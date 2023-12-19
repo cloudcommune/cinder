@@ -31,6 +31,7 @@ create = {
                 'instance_uuid': parameter_types.uuid,
                 'connector': {'type': ['object', 'null']},
                 'volume_uuid': parameter_types.uuid,
+                'mode': {'type': 'string'}
             },
             'required': ['instance_uuid', 'volume_uuid'],
             'additionalProperties': False,

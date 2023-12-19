@@ -2140,6 +2140,7 @@ class API(base.Base):
                           connector=None,
                           attach_mode='null'):
         """Create an attachment record for the specified volume."""
+        LOG.debug('attach_mode=%(attach_mode)s', {'attach_mode': attach_mode})
         ctxt.authorize(attachment_policy.CREATE_POLICY, target_obj=volume_ref)
         connection_info = {}
         if "error" in volume_ref.status:

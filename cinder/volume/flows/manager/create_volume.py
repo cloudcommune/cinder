@@ -1067,7 +1067,7 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
             backup.save()
 
             self.backup_rpcapi.restore_backup(context, backup.host, backup,
-                                              volume.id)
+                                              volume.id, is_rollback=True)
             need_update_volume = False
 
         LOG.info("Created volume %(volume_id)s from backup %(backup_id)s "

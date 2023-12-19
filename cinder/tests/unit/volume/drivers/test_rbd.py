@@ -1557,6 +1557,7 @@ class RBDTestCase(test.TestCase):
                 'secret_type': 'ceph',
                 'secret_uuid': self.cfg.rbd_secret_uuid,
                 'volume_id': self.volume_a.id,
+                'conffile': '/etc/ceph/my_ceph.conf',
                 'discard': True,
                 'keyring': keyring_data,
             }

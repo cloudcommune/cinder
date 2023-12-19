@@ -1195,6 +1195,13 @@ def backup_get(context, backup_id, read_deleted=None, project_only=True):
     return IMPL.backup_get(context, backup_id, read_deleted, project_only)
 
 
+def backup_get_parent_id(context, parent_id, read_deleted=None,
+                         project_only=True):
+    """Get a backup or raise if it does not exist."""
+    return IMPL.backup_get_parent_id(context, parent_id, read_deleted,
+                                     project_only)
+
+
 def backup_get_all(context, filters=None, marker=None, limit=None,
                    offset=None, sort_keys=None, sort_dirs=None):
     """Get all backups."""

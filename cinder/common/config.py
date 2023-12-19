@@ -143,7 +143,19 @@ global_opts = [
                help='The full class name of the consistencygroup API class'),
     cfg.BoolOpt('split_loggers',
                 default=False,
-                help='Log requests to multiple loggers.')
+                help='Log requests to multiple loggers.'),
+    cfg.StrOpt('glance_ceph_user',
+               default='glance',
+               help='the user of glance store'),
+    cfg.StrOpt('glance_ceph_cluster_name',
+               default="ceph",
+               help='the name of glance store cluster  '),
+    cfg.StrOpt('glance_ceph_conf',
+               default='',
+               help='Path to the ceph configuration file'),
+    cfg.StrOpt('glance_ceph_pool',
+               default='images',
+               help='The RADOS pool where rbd image are stored '),
 ]
 
 auth_opts = [

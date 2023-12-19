@@ -58,11 +58,12 @@ class BackupAPI(rpc.RPCAPI):
         cctxt = self._get_cctxt(server=backup.host)
         cctxt.cast(ctxt, 'create_backup', backup=backup)
 
-    def restore_backup(self, ctxt, volume_host, backup, volume_id):
+    def restore_backup(self, ctxt, volume_host, backup, volume_id,
+                       is_rollback):
         LOG.debug("restore_backup in rpcapi backup_id %s", backup.id)
         cctxt = self._get_cctxt(server=volume_host)
         cctxt.cast(ctxt, 'restore_backup', backup=backup,
-                   volume_id=volume_id)
+                   volume_id=volume_id, is_rollback=is_rollback)
 
     def delete_backup(self, ctxt, backup):
         LOG.debug("delete_backup rpcapi backup_id %s", backup.id)

@@ -424,12 +424,13 @@ class TSMBackupDriver(driver.BackupDriver):
 
         LOG.debug('Backup %s finished.', backup.id)
 
-    def restore(self, backup, volume_id, volume_file):
+    def restore(self, backup, volume_id, volume_file, is_rollback=True):
         """Restore the given volume backup from TSM server.
 
         :param backup: backup information for volume
         :param volume_id: volume id
         :param volume_file: file object representing the volume
+        :param is_rollback
         :raises: InvalidBackup
         """
 

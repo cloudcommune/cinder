@@ -40,7 +40,8 @@ class AttachmentsController(wsgi.Controller):
 
     _view_builder_class = attachment_views.ViewBuilder
 
-    allowed_filters = {'volume_id', 'status', 'instance_id', 'attach_status'}
+    allowed_filters = {'volume_id', 'status', 'instance_id', 'attach_status'
+                       'attach_mode'}
 
     def __init__(self, ext_mgr=None):
         """Initialize controller class."""
@@ -167,7 +168,6 @@ class AttachmentsController(wsgi.Controller):
             context,
             volume_uuid)
         args = {'connector': body['attachment'].get('connector', None)}
-
         if req.api_version_request.matches(mv.ATTACHMENT_CREATE_MODE_ARG):
             # We check for attach_mode here and default to `null`
             # if nothing's provided.  This seems odd to not just

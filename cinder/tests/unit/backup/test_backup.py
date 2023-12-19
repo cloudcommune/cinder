@@ -1087,7 +1087,8 @@ class BackupTestCase(BaseBackupTest):
                           self.backup_mgr.restore_backup,
                           self.ctxt,
                           backup,
-                          vol_id)
+                          vol_id,
+                          True)
         backup = db.backup_get(self.ctxt, backup.id)
         vol = db.volume_get(self.ctxt, vol_id)
         self.assertEqual('error_restoring', vol['status'])
@@ -1107,7 +1108,8 @@ class BackupTestCase(BaseBackupTest):
                           self.backup_mgr.restore_backup,
                           self.ctxt,
                           backup,
-                          vol_id)
+                          vol_id,
+                          True)
         vol = db.volume_get(self.ctxt, vol_id)
         self.assertEqual('error', vol['status'])
         backup = db.backup_get(self.ctxt, backup.id)
@@ -1128,7 +1130,8 @@ class BackupTestCase(BaseBackupTest):
                           self.backup_mgr.restore_backup,
                           self.ctxt,
                           backup,
-                          vol_id)
+                          vol_id,
+                          True)
         vol = db.volume_get(self.ctxt, vol_id)
         self.assertEqual('error_restoring', vol['status'])
         backup = db.backup_get(self.ctxt, backup.id)
@@ -1210,7 +1213,8 @@ class BackupTestCase(BaseBackupTest):
                           self.backup_mgr.restore_backup,
                           self.ctxt,
                           backup,
-                          vol_id)
+                          vol_id,
+                          True)
         vol = db.volume_get(self.ctxt, vol_id)
         self.assertEqual('error', vol['status'])
         backup = db.backup_get(self.ctxt, backup.id)
@@ -1232,6 +1236,7 @@ class BackupTestCase(BaseBackupTest):
                                               size=vol_size)
         backup = self._create_backup_db_entry(
             status=fields.BackupStatus.RESTORING, volume_id=vol_id)
+        is_rollback = True
 
         properties = {}
         mock_get_conn.return_value = properties
@@ -1247,7 +1252,8 @@ class BackupTestCase(BaseBackupTest):
         mock_attach_device.return_value = attach_info
 
         with mock.patch('os.name', os_name):
-            self.backup_mgr.restore_backup(self.ctxt, backup, vol_id)
+            self.backup_mgr.restore_backup(self.ctxt, backup, vol_id,
+                                           is_rollback)
 
         mock_open.assert_called_once_with('/dev/null', exp_open_mode)
         mock_temporary_chown.assert_called_once_with('/dev/null')
@@ -1275,7 +1281,7 @@ class BackupTestCase(BaseBackupTest):
             status=fields.BackupStatus.RESTORING, volume_id=vol_id)
         self.backup_mgr._run_restore = mock.Mock()
 
-        self.backup_mgr.restore_backup(self.ctxt, backup, vol_id)
+        self.backup_mgr.restore_backup(self.ctxt, backup, vol_id, True)
         self.assertEqual(2, notify.call_count)
 
     @mock.patch('cinder.volume.volume_utils.clone_encryption_key')
@@ -1342,17 +1348,18 @@ class BackupTestCase(BaseBackupTest):
                                               '_attach_device')
         mock_attach_device.return_value = {'device': {'path': '/dev/null'}}
         mock_clone_encryption_key.return_value = fake.UUID3
+        is_rollback = True
 
         # Mimic the driver's side effect where it updates the volume's
         # metadata. For backups of encrypted volumes, this will essentially
         # overwrite the volume's encryption key ID prior to the restore.
-        def restore_side_effect(backup, volume_id, volume_file):
+        def restore_side_effect(backup, volume_id, volume_file, is_rollback):
             db.volume_update(self.ctxt,
                              volume_id,
                              {'encryption_key_id': fake.UUID4})
         mock_backup_driver_restore.side_effect = restore_side_effect
 
-        self.backup_mgr.restore_backup(self.ctxt, backup, vol_id)
+        self.backup_mgr.restore_backup(self.ctxt, backup, vol_id, is_rollback)
 
         # Volume's original encryption key ID should be deleted
         mock_delete_encryption_key.assert_called_once_with(self.ctxt,
@@ -1399,17 +1406,18 @@ class BackupTestCase(BaseBackupTest):
                                               '_attach_device')
         mock_attach_device.return_value = {'device': {'path': '/dev/null'}}
         mock_clone_encryption_key.return_value = fake.UUID3
+        is_rollback = True
 
         # Mimic the driver's side effect where it updates the volume's
         # metadata. For backups of encrypted volumes, this will essentially
         # overwrite the volume's encryption key ID prior to the restore.
-        def restore_side_effect(backup, volume_id, volume_file):
+        def restore_side_effect(backup, volume_id, volume_file, is_rollback):
             db.volume_update(self.ctxt,
                              volume_id,
                              {'encryption_key_id': fake.UUID4})
         mock_backup_driver_restore.side_effect = restore_side_effect
 
-        self.backup_mgr.restore_backup(self.ctxt, backup, vol_id)
+        self.backup_mgr.restore_backup(self.ctxt, backup, vol_id, is_rollback)
 
         # Volume's original encryption key ID should be deleted
         mock_delete_encryption_key.assert_called_once_with(self.ctxt,

@@ -539,14 +539,16 @@ class Volume(cleanable.CinderCleanableObject, base.CinderObject,
             return False
         return status in ('creating', 'deleting', 'uploading', 'downloading')
 
-    def begin_attach(self, attach_mode):
+    def begin_attach(self, attach_mode, meta_mode=None):
         attachment = objects.VolumeAttachment(
             context=self._context,
             attach_status=c_fields.VolumeAttachStatus.ATTACHING,
-            volume_id=self.id)
+            volume_id=self.id,
+            attach_mode=attach_mode)
         attachment.create()
         with self.obj_as_admin():
-            self.admin_metadata['attached_mode'] = attach_mode
+            if meta_mode:
+                self.admin_metadata['attached_mode'] = meta_mode
             self.save()
         return attachment
 

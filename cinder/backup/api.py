@@ -99,7 +99,7 @@ class API(base.Base):
         # Don't allow backup to be deleted if there are incremental
         # backups dependent on it.
         deltas = self.get_all(context, search_opts={'parent_id': backup.id})
-        if deltas and len(deltas):
+        if deltas and len(deltas) and backup.parent_id is None:
             msg = _('Incremental backups exist for this backup.')
             raise exception.InvalidBackup(reason=msg)
 
@@ -342,7 +342,8 @@ class API(base.Base):
 
         return backup
 
-    def restore(self, context, backup_id, volume_id=None, name=None):
+    def restore(self, context, backup_id, volume_id=None, name=None,
+                is_rollback=True):
         """Make the RPC call to restore a volume backup."""
         backup = self.get(context, backup_id)
         context.authorize(policy.RESTORE_POLICY, target_obj=backup)
@@ -383,8 +384,9 @@ class API(base.Base):
         else:
             volume = self.volume_api.get(context, volume_id)
 
-        if volume['status'] != "available":
-            msg = _('Volume to be restored to must be available')
+        if volume['status'] not in ["available", "in-use", "error_restoring"]:
+            msg = _('Volume to be restored to must be available, '
+                    'in-use or error_restoring')
             raise exception.InvalidVolume(reason=msg)
 
         LOG.debug('Checking backup size %(bs)s against volume size %(vs)s',
@@ -396,8 +398,9 @@ class API(base.Base):
             raise exception.InvalidVolume(reason=msg)
 
         LOG.info("Overwriting volume %(volume_id)s with restore of "
-                 "backup %(backup_id)s",
-                 {'volume_id': volume_id, 'backup_id': backup_id})
+                 "backup %(backup_id)s, is_rollback is %(is_rollback)s",
+                 {'volume_id': volume_id, 'backup_id': backup_id,
+                  'is_rollback': is_rollback})
 
         # Setting the status here rather than setting at start and unrolling
         # for each error condition, it should be a very small window
@@ -405,12 +408,16 @@ class API(base.Base):
             backup.host, backup.availability_zone)
         backup.status = fields.BackupStatus.RESTORING
         backup.restore_volume_id = volume.id
+        # The parent backup of creating incremental backup that
+        # found by latest backup.data_timestamp
+        if is_rollback:
+            backup.data_timestamp = datetime.utcnow()
         backup.save()
         self.db.volume_update(context, volume_id, {'status':
                                                    'restoring-backup'})
 
         self.backup_rpcapi.restore_backup(context, backup.host, backup,
-                                          volume_id)
+                                          volume_id, is_rollback)
 
         d = {'backup_id': backup_id,
              'volume_id': volume_id,

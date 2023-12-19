@@ -1331,7 +1331,8 @@ class VolumeManager(manager.CleanableManager,
         self._notify_about_volume_usage(context, volume,
                                         "attach.start")
 
-        attachment = volume.begin_attach(mode)
+        meta_mode = volume_metadata.get('attached_mode', None)
+        attachment = volume.begin_attach(mode, meta_mode)
 
         if instance_uuid and not uuidutils.is_uuid_like(instance_uuid):
             attachment.attach_status = (
@@ -1666,6 +1667,17 @@ class VolumeManager(manager.CleanableManager,
                 LOG.debug("Uploaded volume to glance image-id: %(image_id)s.",
                           {'image_id': image_meta['id']},
                           resource=volume)
+
+            used_size = self._get_volume_or_image_usage(context, image_meta,
+                                                        image_meta['id'])
+            LOG.info("image '%(image)s' used size %(used_size)sMB ", {
+                "image": image_meta['id'], "used_size": used_size})
+
+            self._notify_about_volume_usage(
+                context, volume, "upload_to_image.end",
+                extra_usage_info={"upload_to_image_size": used_size,
+                                  "upload_to_image_size_unit": "MB",
+                                  "image_id": image_meta['id']})
         except Exception as error:
             LOG.error("Upload volume to image encountered an error "
                       "(image-id: %(image_id)s).",
@@ -1687,6 +1699,24 @@ class VolumeManager(manager.CleanableManager,
                                                              volume_id)
         LOG.info("Copy volume to image completed successfully.",
                  resource=volume)
+
+    def _get_volume_or_image_usage(self, context, image, image_id):
+        used_size = 0
+        try:
+            if "RBDDriver" != self.driver.__class__.__name__:
+                err = _('Backup service %(service)s is not ceph driver.') % {
+                    "service": self.driver.__class__.__name__}
+                raise exception.InvalidBackup(reason=err)
+
+            utils.require_driver_initialized(self.driver)
+
+            used_size = self.driver.get_image_used_size(context, image)
+
+        except Exception as e:
+            LOG.error("Get image '%(image)s' used size failed. "
+                      "Reason is '%(err_mess)s'.",
+                      {"image": image_id, "err_mess": e})
+        return used_size
 
     def _delete_image(self, context, image_id, image_service):
         """Deletes an image stuck in queued or saving state."""
@@ -1727,9 +1757,12 @@ class VolumeManager(manager.CleanableManager,
                     option_per_gb = '%s_per_gb' % option
                     option_per_gb_min = '%s_per_gb_min' % option
                     option_max = '%s_max' % option
+                    option_base = '%s_base' % option
                     if option_per_gb in specs:
+                        base_value = int(specs.pop(option_base, 0))
                         minimum_value = int(specs.pop(option_per_gb_min, 0))
-                        value = int(specs[option_per_gb]) * volume_size
+                        value = base_value + \
+                                int(specs[option_per_gb]) * volume_size
                         per_gb_value = max(minimum_value, value)
                         max_value = int(specs.pop(option_max, per_gb_value))
                         specs[option] = min(per_gb_value, max_value)
@@ -4666,6 +4699,7 @@ class VolumeManager(manager.CleanableManager,
             self.db.volume_admin_metadata_delete(context.elevated(),
                                                  vref.id,
                                                  'attached_mode')
+        vref = objects.Volume.get_by_id(context, vref.id)
         self._notify_about_volume_usage(context, vref, "detach.end")
 
     # Replication group API (Tiramisu)

@@ -212,16 +212,21 @@ class BackupsController(wsgi.Controller):
         restore = body['restore']
         volume_id = restore.get('volume_id', None)
         name = restore.get('name', None)
+        is_rollback = strutils.bool_from_string(restore.get(
+            'is_rollback', True), strict=True)
 
-        LOG.info("Restoring backup %(backup_id)s to volume %(volume_id)s.",
-                 {'backup_id': id, 'volume_id': volume_id},
+        LOG.info("Restoring backup %(backup_id)s to volume %(volume_id)s, "
+                 "current is_rollback is %(is_rollback)s.",
+                 {'backup_id': id, 'volume_id': volume_id,
+                  'is_rollback': is_rollback},
                  context=context)
 
         try:
             new_restore = self.backup_api.restore(context,
                                                   backup_id=id,
                                                   volume_id=volume_id,
-                                                  name=name)
+                                                  name=name,
+                                                  is_rollback=is_rollback)
         # Not found exception will be handled at the wsgi level
         except (exception.InvalidInput,
                 exception.InvalidVolume,

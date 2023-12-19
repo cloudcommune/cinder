@@ -43,7 +43,8 @@ class BackupRPCAPITestCase(test.RPCAPITestCase):
                            server='fake_volume_host',
                            volume_host='fake_volume_host',
                            backup=self.fake_backup_obj,
-                           volume_id=fake.VOLUME_ID)
+                           volume_id=fake.VOLUME_ID,
+                           is_rollback=True)
 
     def test_delete_backup(self):
         self._test_rpc_api('delete_backup',

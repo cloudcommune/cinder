@@ -20,10 +20,10 @@ class FakeBackupService(driver.BackupDriver):
     def __init__(self, context, db=None):
         super(FakeBackupService, self).__init__(context, db)
 
-    def backup(self, backup, volume_file):
+    def backup(self, backup, volume_file, backup_metadata=False):
         pass
 
-    def restore(self, backup, volume_id, volume_file):
+    def restore(self, backup, volume_id, volume_file, is_rollback=True):
         pass
 
     def delete_backup(self, backup):

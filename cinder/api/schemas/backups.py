@@ -85,7 +85,8 @@ restore = {
             'type': ['object', 'null'],
             'properties': {
                 'name': parameter_types.name_allow_zero_min_length,
-                'volume_id': parameter_types.uuid_allow_null
+                'volume_id': parameter_types.uuid_allow_null,
+                'is_rollback': parameter_types.boolean
             },
             'additionalProperties': False,
         },

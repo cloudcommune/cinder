@@ -219,7 +219,10 @@ class AttachmentManagerTestCase(test.TestCase):
         # Tests that _do_attachment_delete does not call remove_export
         # if _connection_terminate returns None indicating there is nothing
         # to consider for the export.
-        volume = mock.MagicMock()
+        # volume = mock.MagicMock()
+        # only for unittest
+        volume_params = {'id': fake.VOLUME_ID}
+        volume = tests_utils.create_volume(self.context, **volume_params)
         attachment = mock.MagicMock()
         with mock.patch.object(self.manager.driver, '_initialized',
                                create=True, new=True):

@@ -136,9 +136,12 @@ class BackupManager(manager.ThreadPoolManager):
         self.service = importutils.import_class(self.driver_name)
 
     def _update_backup_error(self, backup, err,
-                             status=fields.BackupStatus.ERROR):
+                             status=fields.BackupStatus.ERROR,
+                             parent_id_tag=False):
         backup.status = status
         backup.fail_reason = err
+        if parent_id_tag:
+            backup.parent_id = None
         backup.save()
 
     def init_host(self, **kwargs):
@@ -381,7 +384,7 @@ class BackupManager(manager.ThreadPoolManager):
                     'expected_status': expected_status,
                     'actual_status': actual_status,
                 }
-                self._update_backup_error(backup, err)
+                self._update_backup_error(backup, err, parent_id_tag=True)
                 raise exception.InvalidVolume(reason=err)
 
         expected_status = fields.BackupStatus.CREATING
@@ -392,7 +395,7 @@ class BackupManager(manager.ThreadPoolManager):
                 'expected_status': expected_status,
                 'actual_status': actual_status,
             }
-            self._update_backup_error(backup, err)
+            self._update_backup_error(backup, err, parent_id_tag=True)
             raise exception.InvalidBackup(reason=err)
 
         try:
@@ -414,7 +417,8 @@ class BackupManager(manager.ThreadPoolManager):
                         context, volume_id,
                         {'status': previous_status,
                          'previous_status': 'error_backing-up'})
-                self._update_backup_error(backup, six.text_type(err))
+                self._update_backup_error(backup, six.text_type(err),
+                                          parent_id_tag=True)
 
         # Restore the original status.
         if snapshot_id:
@@ -447,8 +451,30 @@ class BackupManager(manager.ThreadPoolManager):
                                                          backup.parent_id)
                 parent_backup.num_dependent_backups += 1
                 parent_backup.save()
-        LOG.info('Create backup %s. backup: %s.', completion_msg, backup.id)
-        self._notify_about_backup_usage(context, backup, "create.end")
+        backup_used_size = self._get_backup_usage(context, backup)
+        LOG.info('Create backup %s. backup: %s. used size: %sM.',
+                 completion_msg, backup.id, backup_used_size)
+        self._notify_about_backup_usage(
+            context, backup, "create.end",
+            extra_usage_info={"backup_used_size": backup_used_size,
+                              "backup_used_size_unit": "MB"})
+
+    def _get_backup_usage(self, context, backup):
+        backup_service = self.service(context)
+        used_size = 0
+        try:
+            if "CephBackupDriver" != backup_service.__class__.__name__:
+                err = _('Backup service %(service)s is not ceph driver.') % {
+                    "service": backup_service.__class__.__name__}
+                raise exception.InvalidBackup(reason=err)
+
+            used_size = backup_service.backup_usage(backup)
+
+        except Exception as e:
+            LOG.error("Get backup '%(backup)s' used size failed. "
+                      "Reason is '%(err_mess)s'.",
+                      {"backup": backup.id, "err_mess": e})
+        return used_size
 
     def _run_backup(self, context, backup, volume):
         # Save a copy of the encryption key ID in case the volume is deleted.
@@ -527,11 +553,12 @@ class BackupManager(manager.ThreadPoolManager):
 
         return False
 
-    def restore_backup(self, context, backup, volume_id):
+    def restore_backup(self, context, backup, volume_id, is_rollback=True):
         """Restore volume backups from configured backup service."""
         LOG.info('Restore backup started, backup: %(backup_id)s '
-                 'volume: %(volume_id)s.',
-                 {'backup_id': backup.id, 'volume_id': volume_id})
+                 'volume: %(volume_id)s, is_rollback: %(is_rollback)s.',
+                 {'backup_id': backup.id, 'volume_id': volume_id,
+                  'is_rollback': is_rollback})
 
         volume = objects.Volume.get_by_id(context, volume_id)
         self._notify_about_backup_usage(context, backup, "restore.start")
@@ -594,7 +621,7 @@ class BackupManager(manager.ThreadPoolManager):
 
         canceled = False
         try:
-            self._run_restore(context, backup, volume)
+            self._run_restore(context, backup, volume, is_rollback)
         except exception.BackupRestoreCancel:
             canceled = True
         except Exception:
@@ -609,6 +636,8 @@ class BackupManager(manager.ThreadPoolManager):
 
         if canceled:
             volume.status = fields.VolumeStatus.ERROR
+        elif volume['attach_status'] == 'attached':
+            volume.status = fields.VolumeStatus.IN_USE
         else:
             volume.status = fields.VolumeStatus.AVAILABLE
             # NOTE(tommylikehu): If previous status is 'creating', this is
@@ -624,9 +653,13 @@ class BackupManager(manager.ThreadPoolManager):
                  {'result': 'Canceled' if canceled else 'Finished',
                   'backup_id': backup.id,
                   'volume_id': volume_id})
-        self._notify_about_backup_usage(context, backup, "restore.end")
+        extra_usage_info = {"is_rollback": is_rollback}
+        if not is_rollback:
+            extra_usage_info["target_volume_id"] = volume_id
+        self._notify_about_backup_usage(context, backup, "restore.end",
+                                        extra_usage_info)
 
-    def _run_restore(self, context, backup, volume):
+    def _run_restore(self, context, backup, volume, is_rollback=True):
         orig_key_id = volume.encryption_key_id
         backup_service = self.service(context)
 
@@ -647,16 +680,19 @@ class BackupManager(manager.ThreadPoolManager):
                 if secure_enabled:
                     with open(device_path, open_mode) as device_file:
                         backup_service.restore(backup, volume.id,
-                                               tpool.Proxy(device_file))
+                                               tpool.Proxy(device_file),
+                                               is_rollback)
                 else:
                     with utils.temporary_chown(device_path):
                         with open(device_path, open_mode) as device_file:
                             backup_service.restore(backup, volume.id,
-                                                   tpool.Proxy(device_file))
+                                                   tpool.Proxy(device_file),
+                                                   is_rollback)
             # device_path is already file-like so no need to open it
             else:
                 backup_service.restore(backup, volume.id,
-                                       tpool.Proxy(device_path))
+                                       tpool.Proxy(device_path),
+                                       is_rollback)
         except exception.BackupRestoreCancel:
             raise
         except Exception:
@@ -772,22 +808,36 @@ class BackupManager(manager.ThreadPoolManager):
             backup.encryption_key_id = None
             backup.save()
 
-        backup.destroy()
         # If this backup is incremental backup, handle the
         # num_dependent_backups of parent backup
+        any_incremental = False
+        extra_usage_info = {}
         if backup.parent_id:
             parent_backup = objects.Backup.get_by_id(context,
                                                      backup.parent_id)
-            if parent_backup.has_dependent_backups:
+            if parent_backup.has_dependent_backups and \
+               (not backup.has_dependent_backups):
                 parent_backup.num_dependent_backups -= 1
                 parent_backup.save()
+            else:
+                next_backup = objects.Backup.get_by_parent_id(context,
+                                                              backup.id)
+                next_backup.parent_id = backup.parent_id
+                next_backup.save()
+                backup_used_size = self._get_backup_usage(context, next_backup)
+                extra_usage_info = {"next_backup_used_size": backup_used_size,
+                                    "backup_used_size_unit": "MB",
+                                    "next_backup_id": next_backup.id}
+                any_incremental = True
+        backup.destroy()
         # Commit the reservations
-        if reservations:
+        if reservations and (not any_incremental):
             QUOTAS.commit(context, reservations,
                           project_id=backup.project_id)
 
         LOG.info('Delete backup finished, backup %s deleted.', backup.id)
-        self._notify_about_backup_usage(context, backup, "delete.end")
+        self._notify_about_backup_usage(context, backup, "delete.end",
+                                        extra_usage_info)
 
     def _notify_about_backup_usage(self,
                                    context,
